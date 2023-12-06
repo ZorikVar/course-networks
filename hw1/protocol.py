@@ -123,7 +123,6 @@ class MyTCPProtocol(BaseProtocol):
         self.inter_idx = 0
 
         self.received_chunks = []
-        self.half_ass_chunk = None
 
         self.next_seed = 555 if self.id == 1 else 7777
         self.received_packages = deque()
@@ -132,7 +131,7 @@ class MyTCPProtocol(BaseProtocol):
 
         self.passive_listener = None
 
-    def listen(self, max_duration = 0.00001):
+    def old_listen(self, max_duration = 0.00001):
         try:
             self.set_timeout(max_duration)
             chunk = self.recvfrom(1500)
@@ -152,7 +151,7 @@ class MyTCPProtocol(BaseProtocol):
         s_time = default_timer()
         self.try_confirm(True)
         while not self.stop_idle and (default_timer() - s_time) < o_idle_duration:
-            self.listen()
+            self.old_listen()
             while len(self.received_chunks) > 0:
                 package = self.package_wrapper.feed(self.received_chunks.pop(0))
                 if package is None:
@@ -195,7 +194,7 @@ class MyTCPProtocol(BaseProtocol):
         nr_collected = 0
         nr_required = None
         while nr_required is None or nr_collected < nr_required:
-            self.listen()
+            self.old_listen()
             self.try_confirm()
 
             while len(self.received_chunks) > 0:
@@ -229,6 +228,7 @@ class MyTCPProtocol(BaseProtocol):
                 if package.TYPE == PackageType.FINAL_SEGMENT:
                     nr_required = i + len(s)
                 res[i:i + len(s)] = s
+
         if self.received_packages:
             raise Exception("logical error")
         self.seeds_to_confirm = []
@@ -317,7 +317,7 @@ class MyTCPProtocol(BaseProtocol):
                 self.send_segment(Segment(start, data[start:end], end == len(data), None))
                 continue
 
-            self.listen(retry_ms)
+            self.old_listen(retry_ms)
 
             while len(self.received_chunks) > 0:
                 package = self.package_wrapper.feed(self.received_chunks.pop(0))
@@ -364,3 +364,22 @@ class MyTCPProtocol(BaseProtocol):
                 self.sendto(message)
 
         return len(data)
+
+
+
+
+    def listen(self, max_duration = 0.00001):
+        try:
+            self.set_timeout(max_duration)
+            chunk = self.recvfrom(1500)
+            if len(chunk) == 0:
+                return None
+            return chunk
+        except TimeoutError:
+            pass
+
+    def spin(self):
+        chunks = []
+        packages = deque()
+        seeds_to_confirm = []
+        sent = {}
