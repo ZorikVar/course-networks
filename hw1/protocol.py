@@ -70,7 +70,7 @@ class Package:
         self.SEGMENT_START = -1
         self.PAYLOAD = b''
 
-        nr_left_bytes = self.LENGTH - 10 - 4 * self.NR_SEEDS
+        nr_left_bytes = self.LENGTH - 14 - 4 * self.NR_SEEDS
         if nr_left_bytes > 0:
             self.SEGMENT_START = self.parser.int32()
             self.PAYLOAD = self.parser.raw_str(nr_left_bytes - 4)
@@ -125,7 +125,7 @@ class Pipe:
         else:
             TYPE = PackageType.GENERAL
         NR_SEEDS = min(len(seeds_to_confirm), o_nr_max_seeds)
-        LENGTH = 14 + NR_SEEDS * 4 + (len(segment.value) if segment is not None else 0)
+        LENGTH = 14 + NR_SEEDS * 4 + (4 + len(segment.value) if segment is not None else 0)
 
         out = Encoder()
         out.int32(INTER_IDX)
@@ -157,6 +157,29 @@ class MyTCPProtocol(BaseProtocol):
     def log(self, *args):
         # print(self.name, *args)
         pass
+
+    def log_sent_package(self, encoded):
+        package = PackageWrapper().feed(encoded)
+        if package is None:
+            self.log('can\'t parse his own message')
+            raise Exception('logical error')
+
+        INTER_IDX = package.INTER_IDX
+        SEED = package.SEED
+        TYPE = package.TYPE
+
+        for confirmed in package.SEEDS:
+            self.log(f"confirms seed=${confirmed}!{INTER_IDX}")
+
+        if len(package.PAYLOAD):
+            maybe_fin = ' final' if TYPE == PackageType.FINAL_SEGMENT else ''
+            self.log(f"is sending ${INTER_IDX}'s{maybe_fin} segment (\033[32;3mseed=${SEED}!{INTER_IDX})\033[0m: {format(package.PAYLOAD)}; start={package.SEGMENT_START}")
+            self.sent[SEED] = (encoded, INTER_IDX)
+        elif TYPE == PackageType.STOP_SENDING:
+            self.log(f'send "please, stop" seed=${SEED}!{INTER_IDX}')
+        else:
+            self.log(f"send a segment <none> seed=${SEED}!{INTER_IDX}")
+            self.sent[SEED] = (encoded, INTER_IDX)
 
     def __init__(self, *args, **kwargs):
         self.name = '\033[34;1mMr B\033[0m' if MyTCPProtocol.nr_nodes == 0 else '\033[31;1mMr J\033[0m'
@@ -251,28 +274,23 @@ class MyTCPProtocol(BaseProtocol):
             return
 
         seed, encoded = self.pipe_out.send_package(None, [], inter_idx=inter_idx, message_type=PackageType.STOP_SENDING)
-        # for confirmed in PackageWrapper().feed(encoded).SEEDS:
-        #     self.log(f"confirms seed=${confirmed}!{inter_idx}")
-        self.log(f'send "please, stop" seed=${seed}!{inter_idx}')
+        self.log_sent_package(encoded)
 
     def try_confirm(self, seeds_to_confirm, force = False):
         o_nr_hanging_confirms = 5
 
         if len(seeds_to_confirm) < o_nr_hanging_confirms or force:
             return
+
         seed, encoded = self.pipe_out.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
-        # for confirmed in PackageWrapper().feed(encoded).SEEDS:
-        #     self.log(f"confirms seed=${confirmed}!{inter_idx}")
-        self.log(f"send a segment <none> seed=${seed}!{self.inter_idx}")
+        self.log_sent_package(encoded)
+
         self.sent[seed] = (encoded, self.inter_idx)
 
     def send_segment(self, segment: Segment, seeds_to_confirm):
         seed, encoded = self.pipe_out.send_package(segment, seeds_to_confirm, inter_idx=self.inter_idx)
+        self.log_sent_package(encoded)
 
-        maybe_fin = ' final' if segment.is_final else ''
-        self.log(f"is sending ${self.inter_idx}'s{maybe_fin} segment (\033[32;3mseed=${seed}!{self.inter_idx})\033[0m: {format(segment.value)}; start={segment.start}")
-        # for confirmed in PackageWrapper().feed(encoded).SEEDS:
-        #     self.log(f"confirms seed=${confirmed}!{inter_idx}")
         self.sent[seed] = (encoded, self.inter_idx)
 
     def send(self, data: bytes):
