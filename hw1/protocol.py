@@ -2,6 +2,7 @@ from enum import IntEnum
 from collections import deque
 from threading import Thread
 from timeit import default_timer
+from random import randint as rand
 
 import socket
 from debugging import *
@@ -17,7 +18,8 @@ else:
     print("Hard mode")
     from judge_protocol import UDPBasedProtocol as BaseProtocol
 
-
+def clock():
+    return time.time_ns() // 1_000_000
 
 # log = noop
 # log = print
@@ -101,6 +103,51 @@ class Segment:
         self.is_final = is_final
         self.seed = seed
 
+class Pipe:
+    seed = 0
+
+    def __init__(self, channel):
+        self.channel = channel
+        self.next_seed = 555 if Pipe.seed == 0 else 7777
+
+        Pipe.seed += 1
+
+    def send_package(self, segment, seeds_to_confirm, *, inter_idx, message_type = None):
+        o_nr_max_seeds = 10
+
+        INTER_IDX = inter_idx
+        self.next_seed += 1
+        SEED = self.next_seed
+        if segment is not None:
+            TYPE = PackageType.FINAL_SEGMENT if segment.is_final else PackageType.GENERAL
+        elif message_type is not None:
+            TYPE = message_type
+        else:
+            TYPE = PackageType.GENERAL
+        NR_SEEDS = min(len(seeds_to_confirm), o_nr_max_seeds)
+        LENGTH = 14 + NR_SEEDS * 4 + (len(segment.value) if segment is not None else 0)
+
+        out = Encoder()
+        out.int32(INTER_IDX)
+        out.int32(LENGTH)
+        out.int32(SEED)
+        out.int8(TYPE)
+        out.int8(NR_SEEDS)
+
+        for _ in range(NR_SEEDS):
+            seed = seeds_to_confirm.pop(0)
+            out.int32(seed)
+
+        if segment is not None and len(segment.value):
+            out.int32(segment.start)
+            out.raw_str(segment.value)
+
+        encoded = out.load()
+        self.channel.sendto(encoded)
+
+        return SEED, encoded
+
+
 class MyTCPProtocol(BaseProtocol):
     nr_nodes = 0
 
@@ -114,19 +161,15 @@ class MyTCPProtocol(BaseProtocol):
     def __init__(self, *args, **kwargs):
         self.name = '\033[34;1mMr B\033[0m' if MyTCPProtocol.nr_nodes == 0 else '\033[31;1mMr J\033[0m'
         MyTCPProtocol.nr_nodes += 1
-        self.id = MyTCPProtocol.nr_nodes
 
         super().__init__(*args, **kwargs)
 
-        self.package_wrapper = PackageWrapper()
+        self.pipe_out = Pipe(super())
 
         self.inter_idx = 0
 
-        self.received_chunks = []
-
-        self.next_seed = 555 if self.id == 1 else 7777
+        self.package_wrapper = PackageWrapper()
         self.received_packages = deque()
-        self.seeds_to_confirm = []
         self.sent = {}
 
         self.passive_listener = None
@@ -137,7 +180,10 @@ class MyTCPProtocol(BaseProtocol):
             chunk = self.recvfrom(1500)
             if len(chunk) == 0:
                 return None
-            self.received_chunks.append(chunk)
+            package = self.package_wrapper.feed(chunk)
+            if package is not None:
+                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
+                self.received_packages.append(package)
         except TimeoutError:
             pass
         except Exception as e:
@@ -145,79 +191,35 @@ class MyTCPProtocol(BaseProtocol):
             self.log(e)
             raise
 
-    def idle_function(self):
-        o_idle_duration = 2
-
-        s_time = default_timer()
-        self.try_confirm(True)
-        while not self.stop_idle and (default_timer() - s_time) < o_idle_duration:
-            self.old_listen()
-            while len(self.received_chunks) > 0:
-                package = self.package_wrapper.feed(self.received_chunks.pop(0))
-                if package is None:
-                    continue
-                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
-
-                for seed in package.SEEDS:
-                    self.log(f"considers confirmed {seed}")
-                    if seed in self.sent:
-                        del self.sent[seed]
-
-                if len(package.PAYLOAD):
-                    self.received_packages.append(package)
-            if self.received_packages:
-                package = self.received_packages.popleft()
-                if package.INTER_IDX == self.inter_idx:
-                    self.ask_to_stop()
-
-    def idle_start(self):
-        self.stop_idle = False
-        self.passive_listener = Thread(target=MyTCPProtocol.idle_function, args=(self,))
-        self.passive_listener.start()
-
-    def idle_stop(self):
-        self.stop_idle = True
-        if self.passive_listener is None:
-            return
-        self.passive_listener.join()
-
-
     def recv(self, n: int):
         self.inter_idx += 1
-        self.idle_stop()
+        # self.idle_stop()
         self.log(f'ready for transacion ${self.inter_idx} as listener')
 
         res = bytearray(n)
         for i in range(n):
             res[i] = 0
 
+        seeds_to_confirm = []
         nr_collected = 0
         nr_required = None
         while nr_required is None or nr_collected < nr_required:
             self.old_listen()
-            self.try_confirm()
+            self.try_confirm(seeds_to_confirm)
 
-            while len(self.received_chunks) > 0:
-                package = self.package_wrapper.feed(self.received_chunks.pop(0))
-                if package is None:
-                    continue
-                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
-
+            while self.received_packages:
+                package = self.received_packages.popleft()
                 if package.INTER_IDX < self.inter_idx:
                     self.llog('got a message from a weirdly old interaction')
+                    self.ask_to_stop(package.INTER_IDX)
 
                 for seed in package.SEEDS:
                     self.log(f"considers confirmed {seed}")
                     if seed in self.sent:
                         del self.sent[seed]
 
-                self.seeds_to_confirm.append(package.SEED)
+                seeds_to_confirm.append(package.SEED)
 
-                if len(package.PAYLOAD):
-                    self.received_packages.append(package)
-
-            while self.received_packages:
-                package = self.received_packages.popleft()
                 if package.INTER_IDX < self.inter_idx:
                     self.log(f'drops an old package ({package.INTER_IDX} < {self.inter_idx})')
                     continue
@@ -231,123 +233,114 @@ class MyTCPProtocol(BaseProtocol):
 
         if self.received_packages:
             raise Exception("logical error")
-        self.seeds_to_confirm = []
         self.sent = {}
-        self.idle_start()
 
         self.log(f"received ${self.inter_idx}: {format(res)}\n")
         return res
 
+    def ask_to_stop(self, inter_idx):
+        last_time = None
+        try:
+            last_time = self.last_time
+        except:
+            pass
+        curr_time = clock()
+        self.last_time = curr_time
 
+        if last_time is not None and curr_time - last_time < 200:
+            return
 
+        seed, encoded = self.pipe_out.send_package(None, [], inter_idx=inter_idx, message_type=PackageType.STOP_SENDING)
+        # for confirmed in PackageWrapper().feed(encoded).SEEDS:
+        #     self.log(f"confirms seed=${confirmed}!{inter_idx}")
+        self.log(f'send "please, stop" seed=${seed}!{inter_idx}')
 
-    def send_message(self, segment, *, message_type = None):
-        o_nr_max_seeds = 10
-
-        self.next_seed += 1
-        SEED = self.next_seed
-        if segment is not None:
-            TYPE = PackageType.FINAL_SEGMENT if segment.is_final else PackageType.GENERAL
-        elif message_type is not None:
-            TYPE = message_type
-        else:
-            TYPE = PackageType.GENERAL
-        NR_SEEDS = min(len(self.seeds_to_confirm), o_nr_max_seeds)
-        LENGTH = 14 + NR_SEEDS * 4 + (len(segment.value) if segment is not None else 0)
-
-        out = Encoder()
-        out.int32(self.inter_idx)
-        out.int32(LENGTH)
-        out.int32(SEED)
-        out.int8(TYPE)
-        out.int8(NR_SEEDS)
-
-        for _ in range(NR_SEEDS):
-            seed = self.seeds_to_confirm.pop(0)
-            self.log(f"confirm seed=${seed}!{self.inter_idx}")
-            out.int32(seed)
-
-        if segment is not None and len(segment.value):
-            out.int32(segment.start)
-            out.raw_str(segment.value)
-
-        encoded = out.load()
-        self.sendto(encoded)
-
-        if segment is not None:
-            maybe_fin = ' final' if TYPE == PackageType.FINAL_SEGMENT else ''
-            self.log(f"is sending ${self.inter_idx}'s{maybe_fin} segment (\033[32;3mseed=${SEED}!{self.inter_idx})\033[0m: {format(segment.value)}; start={segment.start}")
-            self.sent[SEED] = (encoded, self.inter_idx)
-        elif message_type == PackageType.STOP_SENDING:
-            self.log(f'send "please, stop" seed=${SEED}!{self.inter_idx}')
-        else:
-            self.log(f"send a segment <none> seed=${SEED}!{self.inter_idx}")
-            self.sent[SEED] = (encoded, self.inter_idx)
-
-    def ask_to_stop(self):
-        return self.send_message(None, message_type=PackageType.STOP_SENDING)
-
-    def try_confirm(self, force = False):
+    def try_confirm(self, seeds_to_confirm, force = False):
         o_nr_hanging_confirms = 5
 
-        if len(self.seeds_to_confirm) < o_nr_hanging_confirms or force:
+        if len(seeds_to_confirm) < o_nr_hanging_confirms or force:
             return
-        return self.send_message(None)
+        seed, encoded = self.pipe_out.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
+        # for confirmed in PackageWrapper().feed(encoded).SEEDS:
+        #     self.log(f"confirms seed=${confirmed}!{inter_idx}")
+        self.log(f"send a segment <none> seed=${seed}!{self.inter_idx}")
+        self.sent[seed] = (encoded, self.inter_idx)
 
-    def send_segment(self, segment: Segment):
-        return self.send_message(segment)
+    def send_segment(self, segment: Segment, seeds_to_confirm):
+        seed, encoded = self.pipe_out.send_package(segment, seeds_to_confirm, inter_idx=self.inter_idx)
+
+        maybe_fin = ' final' if segment.is_final else ''
+        self.log(f"is sending ${self.inter_idx}'s{maybe_fin} segment (\033[32;3mseed=${seed}!{self.inter_idx})\033[0m: {format(segment.value)}; start={segment.start}")
+        # for confirmed in PackageWrapper().feed(encoded).SEEDS:
+        #     self.log(f"confirms seed=${confirmed}!{inter_idx}")
+        self.sent[seed] = (encoded, self.inter_idx)
 
     def send(self, data: bytes):
         o_nr_hanging_segments = 10
         o_segment_len = 500
 
         self.inter_idx += 1
-        self.idle_stop()
         self.log(f'ready for transaction ${self.inter_idx} to send {format(bytearray(data))}')
 
         retry_ms = 0.002
+        seeds_to_confirm = []
+        first_time = None
 
         done = False
         i = 0
         while len(self.sent) or i < len(data):
             if len(self.sent) < o_nr_hanging_segments and i < len(data):
-                start = i
-                end = min(len(data), start + o_segment_len)
+                start, end = i, i + o_segment_len
+                end = min(end, len(data))
+                segment = Segment(start, data[start:end], end == len(data), None)
+
+                self.send_segment(segment, seeds_to_confirm)
                 i = end
-                self.send_segment(Segment(start, data[start:end], end == len(data), None))
                 continue
 
             self.old_listen(retry_ms)
 
-            while len(self.received_chunks) > 0:
-                package = self.package_wrapper.feed(self.received_chunks.pop(0))
-                if package is None:
-                    continue
-                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
+            if not self.received_packages and i == len(data):
+                curr_time = clock()
+                if first_time is None:
+                    first_time = curr_time
+                if curr_time - first_time > 800:
+                    done = True
+                    break
+            else:
+                first_time = None
 
+            new_pac = []
+            while self.received_packages:
+                package = self.received_packages.popleft()
                 if package.INTER_IDX < self.inter_idx:
                     self.llog('got a message from a weirdly old interaction')
+                    self.ask_to_stop(package.INTER_IDX)
 
                 for seed in package.SEEDS:
                     self.log(f"considers confirmed {seed}")
                     if seed in self.sent:
                         del self.sent[seed]
 
-                self.seeds_to_confirm.append(package.SEED)
+                seeds_to_confirm.append(package.SEED)
 
                 if len(package.PAYLOAD):
-                    self.received_packages.append(package)
+                    new_pac.append(package)
 
                 if package.INTER_IDX > self.inter_idx:
                     self.log(f"sees his partner has moved on")
                     done = True
+                    break
 
                 if package.TYPE == PackageType.STOP_SENDING:
                     if package.INTER_IDX == self.inter_idx:
                         self.log(f"has received request to stop")
                         done = True
+                        break
                     else:
                         self.log(f"has received a deprecated request to stop")
+            for package in new_pac:
+                self.received_packages.append(package)
 
             if done:
                 self.sent = {}
@@ -364,19 +357,6 @@ class MyTCPProtocol(BaseProtocol):
                 self.sendto(message)
 
         return len(data)
-
-
-
-
-    def listen(self, max_duration = 0.00001):
-        try:
-            self.set_timeout(max_duration)
-            chunk = self.recvfrom(1500)
-            if len(chunk) == 0:
-                return None
-            return chunk
-        except TimeoutError:
-            pass
 
     def spin(self):
         chunks = []
