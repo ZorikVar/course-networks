@@ -74,6 +74,25 @@ class Package:
             self.PAYLOAD = self.parser.raw_str(nr_left_bytes - 4)
             # TODO
 
+class PackageWrapper:
+    def __init__(self):
+        self.half_ass_chunk = None
+
+    def feed(self, chunk):
+        if self.half_ass_chunk is not None:
+            chunk = self.half_ass_chunk + chunk
+            self.half_ass_chunk = None
+
+        try:
+            package = Package(chunk)
+        except ValueError as e:
+            if str(e) != 'not enough input bytes':
+                raise e
+            self.half_ass_chunk = chunk
+            return None
+
+        return package
+
 
 class Segment:
     def __init__(self, start: int, value: bytes, is_final: bool, seed):
@@ -84,6 +103,9 @@ class Segment:
 
 class MyTCPProtocol(BaseProtocol):
     nr_nodes = 0
+
+    def llog(self, *args):
+        print(self.name, *args)
 
     def log(self, *args):
         # print(self.name, *args)
@@ -96,20 +118,14 @@ class MyTCPProtocol(BaseProtocol):
 
         super().__init__(*args, **kwargs)
 
-        # Options:
-        self.o_nr_hanging_confirms = 5
-        self.o_nr_hanging_segments = 10
-        self.o_segment_len = 500
-        self.o_nr_max_seeds = 10
-        self.o_idle_duration = 2
+        self.package_wrapper = PackageWrapper()
 
         self.inter_idx = 0
 
-        self.asking_to_stop = False
         self.received_chunks = []
         self.half_ass_chunk = None
 
-        self.last_seed = 555 if self.id == 1 else 7777
+        self.next_seed = 555 if self.id == 1 else 7777
         self.received_packages = deque()
         self.seeds_to_confirm = []
         self.sent = {}
@@ -130,50 +146,26 @@ class MyTCPProtocol(BaseProtocol):
             self.log(e)
             raise
 
-    def gen_seed(self):
-        self.last_seed += 1
-        return self.last_seed
-
-    def process_package(self, package):
-        for seed in package.SEEDS:
-            self.log(f"considers confirmed {seed}")
-            if seed in self.sent:
-                del self.sent[seed]
-
-        if not self.asking_to_stop:
-            self.seeds_to_confirm.append(package.SEED)
-
-        if len(package.PAYLOAD):
-            self.received_packages.append(package)
-
-    def process_chunk(self, chunk):
-        self.log(f'received raw {len(chunk)} bytes')
-
-        if self.half_ass_chunk is not None:
-            chunk = self.half_ass_chunk + chunk
-            self.half_ass_chunk = None
-
-        try:
-            package = Package(chunk)
-        except ValueError as e:
-            if str(e) != 'not enough input bytes':
-                raise e
-            self.half_ass_chunk = chunk
-            return None
-
-        self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
-
-        return package
-
     def idle_function(self):
+        o_idle_duration = 2
+
         s_time = default_timer()
         self.try_confirm(True)
-        while not self.stop_idle and (default_timer() - s_time) < self.o_idle_duration:
+        while not self.stop_idle and (default_timer() - s_time) < o_idle_duration:
             self.listen()
             while len(self.received_chunks) > 0:
-                package = self.process_chunk(self.received_chunks.pop(0))
-                if package is not None:
-                    self.process_package(package);
+                package = self.package_wrapper.feed(self.received_chunks.pop(0))
+                if package is None:
+                    continue
+                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
+
+                for seed in package.SEEDS:
+                    self.log(f"considers confirmed {seed}")
+                    if seed in self.sent:
+                        del self.sent[seed]
+
+                if len(package.PAYLOAD):
+                    self.received_packages.append(package)
             if self.received_packages:
                 package = self.received_packages.popleft()
                 if package.INTER_IDX == self.inter_idx:
@@ -185,34 +177,45 @@ class MyTCPProtocol(BaseProtocol):
         self.passive_listener.start()
 
     def idle_stop(self):
+        self.stop_idle = True
         if self.passive_listener is None:
             return
         self.passive_listener.join()
 
 
-
-
     def recv(self, n: int):
         self.inter_idx += 1
-        self.stop_idle = True
-
         self.idle_stop()
-        self.asking_to_stop = False
-
         self.log(f'ready for transacion ${self.inter_idx} as listener')
 
         res = bytearray(n)
         for i in range(n):
             res[i] = 0
+
         nr_collected = 0
         nr_required = None
         while nr_required is None or nr_collected < nr_required:
             self.listen()
-            while len(self.received_chunks) > 0:
-                package = self.process_chunk(self.received_chunks.pop(0))
-                if package is not None:
-                    self.process_package(package);
             self.try_confirm()
+
+            while len(self.received_chunks) > 0:
+                package = self.package_wrapper.feed(self.received_chunks.pop(0))
+                if package is None:
+                    continue
+                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
+
+                if package.INTER_IDX < self.inter_idx:
+                    self.llog('got a message from a weirdly old interaction')
+
+                for seed in package.SEEDS:
+                    self.log(f"considers confirmed {seed}")
+                    if seed in self.sent:
+                        del self.sent[seed]
+
+                self.seeds_to_confirm.append(package.SEED)
+
+                if len(package.PAYLOAD):
+                    self.received_packages.append(package)
 
             while self.received_packages:
                 package = self.received_packages.popleft()
@@ -230,7 +233,6 @@ class MyTCPProtocol(BaseProtocol):
             raise Exception("logical error")
         self.seeds_to_confirm = []
         self.sent = {}
-        self.asking_to_stop = True
         self.idle_start()
 
         self.log(f"received ${self.inter_idx}: {format(res)}\n")
@@ -240,14 +242,17 @@ class MyTCPProtocol(BaseProtocol):
 
 
     def send_message(self, segment, *, message_type = None):
-        SEED = self.gen_seed()
+        o_nr_max_seeds = 10
+
+        self.next_seed += 1
+        SEED = self.next_seed
         if segment is not None:
             TYPE = PackageType.FINAL_SEGMENT if segment.is_final else PackageType.GENERAL
         elif message_type is not None:
             TYPE = message_type
         else:
             TYPE = PackageType.GENERAL
-        NR_SEEDS = min(len(self.seeds_to_confirm), self.o_nr_max_seeds)
+        NR_SEEDS = min(len(self.seeds_to_confirm), o_nr_max_seeds)
         LENGTH = 14 + NR_SEEDS * 4 + (len(segment.value) if segment is not None else 0)
 
         out = Encoder()
@@ -272,72 +277,90 @@ class MyTCPProtocol(BaseProtocol):
         if segment is not None:
             maybe_fin = ' final' if TYPE == PackageType.FINAL_SEGMENT else ''
             self.log(f"is sending ${self.inter_idx}'s{maybe_fin} segment (\033[32;3mseed=${SEED}!{self.inter_idx})\033[0m: {format(segment.value)}; start={segment.start}")
-            self.sent[SEED] = encoded
+            self.sent[SEED] = (encoded, self.inter_idx)
         elif message_type == PackageType.STOP_SENDING:
             self.log(f'send "please, stop" seed=${SEED}!{self.inter_idx}')
         else:
             self.log(f"send a segment <none> seed=${SEED}!{self.inter_idx}")
-            self.sent[SEED] = encoded
+            self.sent[SEED] = (encoded, self.inter_idx)
 
     def ask_to_stop(self):
         return self.send_message(None, message_type=PackageType.STOP_SENDING)
 
     def try_confirm(self, force = False):
-        if len(self.seeds_to_confirm) < self.o_nr_hanging_confirms or force:
+        o_nr_hanging_confirms = 5
+
+        if len(self.seeds_to_confirm) < o_nr_hanging_confirms or force:
             return
         return self.send_message(None)
 
     def send_segment(self, segment: Segment):
         return self.send_message(segment)
 
-    def retry_segment(self):
-        if len(self.sent) == 0:
-            return
-        arbitrary = next(iter(self.sent.keys()))
-        self.log(f'retry to send seed=${arbitrary}!{self.inter_idx}')
-        self.sendto(self.sent[arbitrary])
-
     def send(self, data: bytes):
+        o_nr_hanging_segments = 10
+        o_segment_len = 500
+
         self.inter_idx += 1
-        self.stop_idle = True
+        self.idle_stop()
         self.log(f'ready for transaction ${self.inter_idx} to send {format(bytearray(data))}')
 
         retry_ms = 0.002
 
         done = False
-
         i = 0
         while len(self.sent) or i < len(data):
-            if done:
-                raise Exception("logical error")
-
-            if len(self.sent) < self.o_nr_hanging_segments and i < len(data):
+            if len(self.sent) < o_nr_hanging_segments and i < len(data):
                 start = i
-                end = min(len(data), start + self.o_segment_len)
+                end = min(len(data), start + o_segment_len)
                 i = end
                 self.send_segment(Segment(start, data[start:end], end == len(data), None))
                 continue
 
             self.listen(retry_ms)
-            self.retry_segment()
 
             while len(self.received_chunks) > 0:
-                package = self.process_chunk(self.received_chunks.pop(0))
-                if package is not None:
-                    self.process_package(package);
-                    if package.INTER_IDX > self.inter_idx:
-                        self.log(f"sees his partner has moved on")
+                package = self.package_wrapper.feed(self.received_chunks.pop(0))
+                if package is None:
+                    continue
+                self.log(f'received segment {format(package.PAYLOAD)}; seed=${package.SEED}!{self.inter_idx}')
+
+                if package.INTER_IDX < self.inter_idx:
+                    self.llog('got a message from a weirdly old interaction')
+
+                for seed in package.SEEDS:
+                    self.log(f"considers confirmed {seed}")
+                    if seed in self.sent:
+                        del self.sent[seed]
+
+                self.seeds_to_confirm.append(package.SEED)
+
+                if len(package.PAYLOAD):
+                    self.received_packages.append(package)
+
+                if package.INTER_IDX > self.inter_idx:
+                    self.log(f"sees his partner has moved on")
+                    done = True
+
+                if package.TYPE == PackageType.STOP_SENDING:
+                    if package.INTER_IDX == self.inter_idx:
+                        self.log(f"has received request to stop")
                         done = True
-                    if package.TYPE == PackageType.STOP_SENDING:
-                        if package.INTER_IDX == self.inter_idx:
-                            self.log(f"has received request to stop")
-                            done = True
-                        else:
-                            self.log(f"has received a deprecated request to stop")
+                    else:
+                        self.log(f"has received a deprecated request to stop")
+
             if done:
                 self.sent = {}
-        done = False
-        if len(self.seeds_to_confirm):
-            self.seeds_to_confirm = []
+                break
+
+            if len(self.sent) > 0:
+                seed = next(iter(self.sent.keys()))
+                message, inter_idx = self.sent[seed]
+                if inter_idx < self.inter_idx:
+                    self.sent[seed]
+                    continue
+
+                self.log(f'retry to send seed=${seed}!{self.inter_idx}')
+                self.sendto(message)
 
         return len(data)
