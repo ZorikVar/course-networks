@@ -145,10 +145,10 @@ def fmt_seed(seed, inter_idx):
     return f'\033[32;3mseed=${seed}!{inter_idx}\033[0m'
 
 
-o_no_hear = 300
-o_retry_ms = 45
 o_no_hear = 1500
 o_retry_ms = 350
+o_no_hear = 500
+o_retry_ms = 45
 
 class MyTCPProtocol(BaseProtocol):
     nr_nodes = 0
