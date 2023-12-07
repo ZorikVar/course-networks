@@ -9,12 +9,11 @@ a = MyTCPProtocol(None)
 b = MyTCPProtocol(a)
 a.other = b
 
-BIG_SIZE = 20000
+BIG_SIZE = 10_0
 
 message_pool = ["I can see you.", "I'm afraid you're going to jail", "You. Not me.",
                 "Be not afraid as the end has passed and you're still here."]
-
-message_pool = [(x + ' ') * BIG_SIZE for x in message_pool]
+message_pool = [(x + ' ') * (BIG_SIZE // len(x)) for x in message_pool]
 message_pool = [x[:BIG_SIZE] for x in message_pool]
 
 def truncate(s):

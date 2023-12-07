@@ -47,4 +47,3 @@ class Decoder:
         parsed = self.buffer[:n]
         self.buffer = self.buffer[n:]
         return parsed
-
