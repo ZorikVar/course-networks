@@ -13,6 +13,7 @@ class InMemoryProtocol:
     def sendto(self, data):
         a, b, q = 10, 20, 70
         lot = rand(0, q - 1)
+        lot = q
         if lot < a:
             pass
         elif lot < b:
@@ -23,7 +24,8 @@ class InMemoryProtocol:
 
     def recvfrom(self, n):
         if len(self.buffer) == 0 or len(self.buffer[0]):
-            time.sleep(self.t)
+            # time.sleep(self.t)
+            pass
 
         if len(self.buffer) == 0:
             return b''

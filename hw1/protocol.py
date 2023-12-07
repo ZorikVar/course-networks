@@ -148,13 +148,17 @@ def fmt_seed(seed, inter_idx):
 class MyTCPProtocol(BaseProtocol):
     nr_nodes = 0
 
-    def log1(self, *args):
-        print(self.name, *args)
+    def log2(self, *args):
         return
+        print(self.name, *args)
+
+    def log1(self, *args):
+        return
+        print(self.name, *args)
 
     def log(self, *args):
-        print(self.name, *args)
         return
+        print(self.name, *args)
 
     def log_sent_package(self, message):
         package = PackageWrapper().feed(message)
@@ -172,12 +176,10 @@ class MyTCPProtocol(BaseProtocol):
         if len(package.PAYLOAD):
             maybe_fin = ' final' if META == Metadata.FINAL_SEGMENT else ''
             self.log(f"is sending ${INTER_IDX}'s{maybe_fin} segment ({fmt_seed(SEED,  package.INTER_IDX)}): {format(package.PAYLOAD)}; start={package.SEGMENT_START}")
-            self.sent[SEED] = (message, INTER_IDX)
         elif META == Metadata.STOP_SENDING:
             self.log(f'is sending "please, stop" {fmt_seed(SEED, INTER_IDX)}')
         else:
             self.log(f"is sending a segment <none> {fmt_seed(SEED, INTER_IDX)}")
-            self.sent[SEED] = (message, INTER_IDX)
 
     def __init__(self, *args, **kwargs):
         self.name = '\033[34;1mMr B\033[0m' if MyTCPProtocol.nr_nodes % 2 == 0 else '\033[31;1mMr J\033[0m'
@@ -186,190 +188,22 @@ class MyTCPProtocol(BaseProtocol):
         super().__init__(*args, **kwargs)
 
         self.pipe = Pipe(super())
-        self.received_packages = deque()
-        self.sent = {}
+        self.received_packages = []
         self.inter_idx = 0
-
-    def recv(self, n: int):
-        self.inter_idx += 1
-        self.log(f'ready for transacion ${self.inter_idx} as listener')
-
-        buff = bytearray(n)
-        for i in range(n):
-            buff[i] = 0
-
-        seen = set()
-        self.received_packages = deque(self.received_packages)
-
-        seeds_to_confirm = []
-        nr_collected = 0
-        nr_required = None
-        while nr_required is None or nr_collected < nr_required:
-            for package in self.pipe.incoming():
-                self.log(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
-                self.received_packages.append(package)
-            self.try_confirm(seeds_to_confirm)
-
-            while self.received_packages:
-                package = self.received_packages.popleft()
-
-                for seed in package.SEEDS:
-                    self.log(f"considers confirmed {seed}")
-                    if seed in self.sent:
-                        del self.sent[seed]
-
-                if package.INTER_IDX < self.inter_idx:
-                    self.log1(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
-                    self.ask_to_stop(package.INTER_IDX)
-
-                seeds_to_confirm.append(package.SEED)
-
-                if package.INTER_IDX < self.inter_idx:
-                    self.log(f'drops an old package ({package.INTER_IDX} < {self.inter_idx})')
-                    continue
-
-                if package.SEGMENT_START in seen:
-                    continue
-                seen.add(package.SEGMENT_START)
-
-                i = package.SEGMENT_START
-                s = package.PAYLOAD
-                nr_collected += len(s)
-                if package.META == Metadata.FINAL_SEGMENT:
-                    nr_required = i + len(s)
-                buff[i:i + len(s)] = s
-
-        if self.received_packages:
-            raise Exception("logical error")
-        self.sent = {}
-
-        self.log1(f"received ${self.inter_idx}: {format(buff)}\n")
-
-        if nr_collected < nr_required:
-            self.log1("RECEIVED INCOMPLETE DATA")
-            raise Exception("RECEIVED INCOMPLETE DATA")
-        return buff
-
-    def ask_to_stop(self, inter_idx):
-        last_time = None
-        try:
-            last_time = self.last_time
-        except:
-            pass
-        curr_time = clock()
-
-        if last_time is not None and curr_time - last_time < 200:
-            return
-
-        self.last_time = curr_time
-        seed, message = self.pipe.send_package(None, [], inter_idx=inter_idx, meta=Metadata.STOP_SENDING)
-        self.log_sent_package(message)
-
-    def try_confirm(self, seeds_to_confirm, force = False):
-        o_nr_hanging_confirms = 5
-
-        if not force and len(seeds_to_confirm) < o_nr_hanging_confirms:
-            return
-
-        seed, message = self.pipe.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
-        self.log_sent_package(message)
-
-        self.sent[seed] = (message, self.inter_idx)
 
     def send_segment(self, segment: Segment, seeds_to_confirm):
         seed, message = self.pipe.send_package(segment, seeds_to_confirm, inter_idx=self.inter_idx)
         self.log_sent_package(message)
-
-        self.sent[seed] = (message, self.inter_idx)
         return seed, message
 
-    def send(self, data: bytes):
-        return self.spin(data)
-        o_nr_hanging_segments = 10
-        o_segment_len = 1500
+    def send(self, data):
+        start_time = clock()
 
-        self.inter_idx += 1
-        self.log(f'ready for transaction ${self.inter_idx} to send {format(bytearray(data))}')
+        o_no_hear = 300
+        o_retry_ms = 45
+        o_no_hear = 1500
+        o_retry_ms = 750
 
-        retry_ms = 0.00002
-        seeds_to_confirm = []
-        first_time = None
-
-        done = False
-        i = 0
-        while len(self.sent) or i < len(data):
-            if len(self.sent) < o_nr_hanging_segments and i < len(data):
-                start, end = i, i + o_segment_len
-                end = min(end, len(data))
-                segment = Segment(start, data[start:end], end == len(data), None)
-
-                self.send_segment(segment, seeds_to_confirm)
-                i = end
-                continue
-
-            for package in self.pipe.incoming(retry_ms):
-                self.log(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
-                self.received_packages.append(package)
-
-            if not self.received_packages and i == len(data):
-                curr_time = clock()
-                if first_time is None:
-                    first_time = curr_time
-                if curr_time - first_time > 200:
-                    done = True
-                    break
-            else:
-                first_time = None
-
-            new_pac = []
-            while self.received_packages:
-                package = self.received_packages.popleft()
-                if package.INTER_IDX < self.inter_idx:
-                    self.log1(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
-                    self.ask_to_stop(package.INTER_IDX)
-
-                for seed in package.SEEDS:
-                    self.log(f"considers confirmed {seed}")
-                    if seed in self.sent:
-                        del self.sent[seed]
-
-                seeds_to_confirm.append(package.SEED)
-
-                if len(package.PAYLOAD) and package.INTER_IDX >= self.inter_idx:
-                    new_pac.append(package)
-
-                if package.INTER_IDX > self.inter_idx:
-                    self.log(f"sees his partner has moved on")
-                    done = True
-                    break
-
-                if package.META == Metadata.STOP_SENDING:
-                    if package.INTER_IDX == self.inter_idx:
-                        self.log(f"has received request to stop")
-                        done = True
-                        break
-                    else:
-                        self.log(f"has received a deprecated request to stop")
-            for package in new_pac:
-                self.received_packages.append(package)
-
-            if done:
-                self.sent = {}
-                break
-
-            if len(self.sent) > 0:
-                seed = next(iter(self.sent.keys()))
-                message, inter_idx = self.sent[seed]
-                if inter_idx < self.inter_idx:
-                    self.sent[seed]
-                    continue
-
-                self.log(f'retries to send {fmt_seed(seed, self.inter_idx)}')
-                self.sendto(message)
-
-        return len(data)
-
-    def spin(self, data):
         self.inter_idx += 1
 
         o_nr_hanging_segments = 10
@@ -388,6 +222,7 @@ class MyTCPProtocol(BaseProtocol):
 
         state = NEXT_SEGMENT
         latest_retry = clock()
+        last_heard = clock()
 
         next_inter = []
 
@@ -411,17 +246,21 @@ class MyTCPProtocol(BaseProtocol):
                 sent[seed] = message
 
             elif state == CHECK_INCOMING:
+                if clock() - last_heard > o_no_hear:
+                    state = DONE
+                    continue
+
                 packages = self.pipe.incoming(0.01)
                 if len(packages) == 0:
                     state = RETRY_SEGMENT
                     continue
 
+                last_heard = clock()
                 for package in packages:
                     self.log(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
 
                     if package.INTER_IDX < self.inter_idx:
                         self.log1(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
-                        # self.ask_to_stop(package.INTER_IDX)
                         continue
                     elif package.INTER_IDX > self.inter_idx:
                         self.log(f"sees his partner has moved on")
@@ -439,12 +278,12 @@ class MyTCPProtocol(BaseProtocol):
                             del sent[seed]
                     seeds_to_confirm.append(package.SEED)
 
-                if state != DONE:
+                if state == CHECK_INCOMING:
                     state = NEXT_SEGMENT
 
             elif state == RETRY_SEGMENT:
                 now = clock()
-                if now - latest_retry < 200:
+                if now - latest_retry < o_retry_ms:
                     state = CHECK_INCOMING
                     continue
                 latest_retry = now
@@ -456,10 +295,100 @@ class MyTCPProtocol(BaseProtocol):
                 self.log(f'retries to send {fmt_seed(seed, self.inter_idx)}')
                 self.sendto(sent[seed])
 
-            elif state == DONE:
-                self.received_packages = next_inter
-
             else:
                 raise Exception('invalid state')
 
+        self.log(f'collected {next_inter} for the next interaction')
+        self.received_packages = next_inter
+
+        self.log2(clock() - start_time)
+
         return len(data)
+
+    def recv(self, n: int):
+        start_time = clock()
+
+        self.inter_idx += 1
+        self.log(f'ready for transacion ${self.inter_idx} as listener')
+
+        buff = bytearray(n)
+        for i in range(n):
+            buff[i] = 0
+
+        received = self.received_packages
+        self.log(f'started listening with {received} packages')
+        self.received_packages = []
+
+        sent = set()
+        seen = set()
+        seeds_to_confirm = []
+        nr_collected = 0
+        nr_required = None
+        latest_ask_to_stop = clock()
+
+        LISTEN = 1
+        PROCESS_RECEIVED = 2
+        ASK_TO_STOP = 3
+        DONE = 4
+
+        state = PROCESS_RECEIVED
+
+        while state != DONE:
+            # self.log(f'is in state {state}')
+            if state == LISTEN:
+                for package in self.pipe.incoming():
+                    self.log(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
+                    received.append(package)
+                    state = PROCESS_RECEIVED
+
+            elif state == PROCESS_RECEIVED:
+                for package in received:
+                    for seed in package.SEEDS:
+                        self.log(f"considers confirmed {seed}")
+                        if seed in sent:
+                            del sent[seed]
+
+                    if package.INTER_IDX < self.inter_idx:
+                        self.log1(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
+                        state = ASK_TO_STOP
+                        continue
+
+                    seeds_to_confirm.append(package.SEED)
+
+                    if package.SEGMENT_START in seen:
+                        continue
+                    seen.add(package.SEGMENT_START)
+
+                    i = package.SEGMENT_START
+                    s = package.PAYLOAD
+                    nr_collected += len(s)
+                    if package.META == Metadata.FINAL_SEGMENT:
+                        nr_required = i + len(s)
+                    buff[i:i + len(s)] = s
+
+                    if nr_collected == nr_required:
+                        state = DONE
+                received = []
+                if state == PROCESS_RECEIVED:
+                    state = LISTEN
+
+            elif state == ASK_TO_STOP:
+                now = clock()
+                if now - latest_ask_to_stop < 200:
+                    state = LISTEN
+                    continue
+                latest_ask_to_stop = now
+
+                seed, message = self.pipe.send_package(None, [], inter_idx=inter_idx, meta=Metadata.STOP_SENDING)
+                self.log_sent_package(message)
+                state = LISTEN
+
+        self.log1(f"received ${self.inter_idx}: {format(buff)}\n")
+
+        if nr_collected < nr_required:
+            self.log1("RECEIVED INCOMPLETE DATA")
+            raise Exception("RECEIVED INCOMPLETE DATA")
+
+        self.log2(clock() - start_time)
+
+        return buff
