@@ -399,6 +399,9 @@ class MyTCPProtocol(BaseProtocol):
 
         self.log1(f"received ${self.inter_idx}: {format(buff)}\n")
 
+        # seed, message = self.pipe.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
+        # self.log_sent_package(message)
+
         if nr_required is None or nr_collected < nr_required:
             self.log1("RECEIVED INCOMPLETE DATA")
             raise Exception("RECEIVED INCOMPLETE DATA")
