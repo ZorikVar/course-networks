@@ -9,14 +9,14 @@ a = MyTCPProtocol(None)
 b = MyTCPProtocol(a)
 a.other = b
 
-BIG_SIZE = 10_0
+BIG_SIZE = 1_00_000
 
 message_pool = ["I can see you.", "I'm afraid you're going to jail", "You. Not me.",
                 "Be not afraid as the end has passed and you're still here."]
 message_pool = [(x + ' ') * (BIG_SIZE // len(x)) for x in message_pool]
 message_pool = [x[:BIG_SIZE] for x in message_pool]
 
-def truncate(s):
+def fmt_truncate(s):
     bound = 65
     if len(s) < bound:
         return s
@@ -29,11 +29,11 @@ def server(x, idx):
     for transaction in range(0, 99):
         if (transaction + (A if idx == 0 else B)) % C < B:
             message = message_pool[transaction % len(message_pool)]
-            print(f'{name} sends {truncate(message)}')
+            print(f'{name} sends {fmt_truncate(message)}')
             x.send(str.encode(message))
         else:
             message = x.recv(BIG_SIZE).decode('utf-8')
-            print(f'{name} heard {truncate(message)}')
+            print(f'{name} heard {fmt_truncate(message)}')
 
 def main():
     thread_a = Thread(target=server, args=(a,0))
