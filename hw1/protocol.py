@@ -14,10 +14,10 @@ with open('.mode', mode='r') as fd:
     mode = fd.read().strip()
     if mode == 'simple':
         print("=" * 80, " Simple mode ".center(80, '='), "=" * 80, sep='\n')
-        from debug_protocol import InMemoryProtocol as BaseProtocol
+        from protocol_in_memory import InMemoryProtocol as BaseProtocol
     else:
         print("Hard mode")
-        from judge_protocol import UDPBasedProtocol as BaseProtocol
+        from protocol_udp_based import UDPBasedProtocol as BaseProtocol
         print = log
 
 
@@ -80,6 +80,34 @@ class PackageWrapper:
             return None
 
 
+def clock_ms():
+    return time.time_ns() / 1000_000
+time_zero = clock_ms()
+
+fdJ = open('logJ', 'w')
+fdB = open('logB', 'w')
+fdX = open('log', 'w')
+
+no_log = False
+no_log_roles = ['recv']
+no_log_roles = []
+
+T = print_fmt
+def print_fmt(*args, **kwargs):
+    T(f'{clock_ms() - time_zero:.3f}', *args, **kwargs)
+if no_log:
+    print_fmt = lambda *args, **kwargs: None
+
+def logJ(*args):
+    print_fmt(*args, file=fdJ)
+    print_fmt(*args, file=fdX)
+def logB(*args):
+    print_fmt(*args, file=fdB)
+    print_fmt(*args, file=fdX)
+def logX(*args):
+    print_fmt(*args, file=fdB)
+    print_fmt(*args, file=fdX)
+
 class Pipe:
     seed = 0
 
@@ -88,16 +116,28 @@ class Pipe:
         self.next_seed = 555 if Pipe.seed % 2 == 0 else 7777
         self.package_wrapper = PackageWrapper()
 
+        self.name = '\033[34;1mMr B\033[0m' if Pipe.seed % 2 == 0 else '\033[31;1mMr J\033[0m'
+        self.fd = fdB if Pipe.seed % 2 == 0 else fdJ
         Pipe.seed += 1
 
+    def incoming_unsafe(self, max_duration = 0.00001):
+        # print(f'{clock_ms() - time_zero:.3f} {self.name}: in \'em, eat \'em', file=self.fd)
+        S_TIME = clock_ms()
+        self.channel.set_timeout(max_duration)
+        chunk = self.channel.recvfrom(999999999)
+        package = self.package_wrapper.feed(chunk)
+        # print(f'{clock_ms() - time_zero:.3f} {self.name}: incoming(): {clock_ms() - S_TIME} ms', file=self.fd)
+        return () if package is None else (package,)
     def incoming(self, max_duration = 0.00001):
         try:
+            S_TIME = clock_ms()
             self.channel.set_timeout(max_duration)
             chunk = self.channel.recvfrom(999999999)
             package = self.package_wrapper.feed(chunk)
-            return [] if package is None else [package]
+            # print(f'{clock_ms() - time_zero:.3f} {self.name}: incoming(): {clock_ms() - S_TIME} ms', file=self.fd)
+            return () if package is None else (package,)
         except TimeoutError:
-            return []
+            return ()
 
     def send_package(self, segment, seeds_to_confirm, *, inter_idx, meta = None):
         o_nr_max_seeds = 30
@@ -140,32 +180,31 @@ class Segment:
         self.is_final = is_final
         self.seed = seed
 
-
 def fmt_seed(seed, inter_idx):
     return f'\033[32;3mseed=${seed}!{inter_idx}\033[0m'
 
 
 o_no_hear = 1500
 o_retry_ms = 350
-o_no_hear = 500
-o_retry_ms = 45
+o_no_hear = 330
+o_retry_ms = 35
+o_no_hear = 5000
 
 class MyTCPProtocol(BaseProtocol):
     nr_nodes = 0
 
-    def log2(self, *args):
-        return
-        print(self.name, *args)
-
-    def log1(self, *args):
-        return
-        print(self.name, *args)
-
     def log(self, *args):
-        return
-        print(self.name, *args)
+        if self.role in no_log_roles:
+            return
+        if self.name.find('J') != -1:
+            logJ(self.name, *args)
+        else:
+            logB(self.name, *args)
 
     def log_sent_package(self, message):
+        if no_log or self.role in no_log_roles:
+            return
+
         package = PackageWrapper().feed(message)
         if package is None:
             self.log('can\'t parse his own message')
@@ -177,14 +216,17 @@ class MyTCPProtocol(BaseProtocol):
 
         for confirmed in package.SEEDS:
             self.log(f"confirms {fmt_seed(confirmed, INTER_IDX)}")
+            pass
 
         if len(package.PAYLOAD):
             maybe_fin = ' final' if META == Metadata.FINAL_SEGMENT else ''
-            self.log1(f"is sending ${INTER_IDX}'s{maybe_fin} segment ({fmt_seed(SEED,  package.INTER_IDX)}): {format(package.PAYLOAD)}; start={package.SEGMENT_START}")
+            self.log(f"is sending ${INTER_IDX}'s{maybe_fin} segment ({fmt_seed(SEED,  package.INTER_IDX)}): {format(package.PAYLOAD)}; start={package.SEGMENT_START}")
         elif META == Metadata.STOP_SENDING:
-            self.log1(f'is sending "please, stop" {fmt_seed(SEED, INTER_IDX)}')
+            self.log(f'is sending "please, stop" {fmt_seed(SEED, INTER_IDX)}')
+            pass
         else:
-            self.log1(f"is sending a segment <none> {fmt_seed(SEED, INTER_IDX)}")
+            self.log(f"is sending a segment <none> {fmt_seed(SEED, INTER_IDX)}")
+            pass
 
     def __init__(self, *args, **kwargs):
         self.name = '\033[34;1mMr B\033[0m' if MyTCPProtocol.nr_nodes % 2 == 0 else '\033[31;1mMr J\033[0m'
@@ -202,12 +244,15 @@ class MyTCPProtocol(BaseProtocol):
         return seed, message
 
     def send(self, data):
-        start_time = clock()
+        self.role = 'send'
+
+        start_time = clock_ms()
+        self.log(f'ready for transaction ${self.inter_idx} as sender')
 
         self.inter_idx += 1
 
         o_nr_hanging_segments = 10
-        o_segment_len = 1500
+        o_segment_len = 50000
 
         NEXT_SEGMENT = 1
         CHECK_INCOMING = 2
@@ -244,24 +289,27 @@ class MyTCPProtocol(BaseProtocol):
                 seed, message = self.send_segment(segment, seeds_to_confirm)
                 i = end
                 sent[seed] = message
+                state = DONE
 
             elif state == CHECK_INCOMING:
                 if clock() - last_heard > o_no_hear:
-                    self.log1('GOT FUCKING TIRED')
+                    self.log('GOT FUCKING TIRED')
                     state = DONE
                     continue
 
-                packages = self.pipe.incoming(0.01)
+                self.log('will check for incoming')
+                packages = self.pipe.incoming_unsafe(0.01)
+                self.log('got \'em, eat \'em')
                 if len(packages) == 0:
                     state = RETRY_SEGMENT
                     continue
 
                 last_heard = clock()
                 for package in packages:
-                    self.log1(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
+                    self.log(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
 
                     if package.INTER_IDX < self.inter_idx:
-                        self.log1(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
+                        self.log(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
                         continue
                     elif package.INTER_IDX > self.inter_idx:
                         self.log(f"sees his partner has moved on")
@@ -293,7 +341,7 @@ class MyTCPProtocol(BaseProtocol):
                     raise Exception('logic error')
 
                 seed = next(iter(sent.keys()))
-                self.log1(f'retries to send {fmt_seed(seed, self.inter_idx)}')
+                self.log(f'retries to send {fmt_seed(seed, self.inter_idx)}')
                 self.sendto(sent[seed])
 
             else:
@@ -302,15 +350,17 @@ class MyTCPProtocol(BaseProtocol):
         self.log(f'collected {next_inter} for the next interaction')
         self.received_packages = next_inter
 
-        self.log2(clock() - start_time)
+        self.log(f'send() in {clock_ms() - start_time:.5f} ms')
 
         return len(data)
 
     def recv(self, n: int):
-        start_time = clock()
+        self.role = 'recv'
+
+        start_time = clock_ms()
 
         self.inter_idx += 1
-        self.log1(f'ready for transaction ${self.inter_idx} as listener')
+        self.log(f'ready for transaction ${self.inter_idx} as listener')
 
         buff = bytearray(n)
         for i in range(n):
@@ -327,6 +377,7 @@ class MyTCPProtocol(BaseProtocol):
         nr_required = None
         latest_ask_to_stop = clock()
         last_heard = clock()
+        silence_counter = 0
 
         LISTEN = 1
         PROCESS_RECEIVED = 2
@@ -339,16 +390,21 @@ class MyTCPProtocol(BaseProtocol):
         while state != DONE:
             # self.log(f'is in state {state}')
             if state == LISTEN:
+                silence_counter += 1
                 if clock() - last_heard > o_no_hear:
-                    self.log1('GOT FUCKING TIRED')
+                    self.log('GOT FUCKING TIRED')
                     state = DONE
                     continue
 
                 for package in self.pipe.incoming():
-                    self.log1(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
+                    self.log(f'received segment {format(package.PAYLOAD)}; {fmt_seed(package.SEED, package.INTER_IDX)}')
                     received.append(package)
                     state = PROCESS_RECEIVED
                     last_heard = clock()
+                    silence_counter = 0
+
+                if state == LISTEN and silence_counter > 10:
+                    state = CONFIRM
 
             elif state == PROCESS_RECEIVED:
                 for package in received:
@@ -358,7 +414,7 @@ class MyTCPProtocol(BaseProtocol):
                             del sent[seed]
 
                     if package.INTER_IDX < self.inter_idx:
-                        self.log1(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
+                        self.log(f'got a message from a weirdly old interaction {fmt_seed(package.SEED, package.INTER_IDX)}')
                         state = ASK_TO_STOP
                         continue
 
@@ -376,14 +432,16 @@ class MyTCPProtocol(BaseProtocol):
                     buff[i:i + len(s)] = s
 
                     if nr_collected == nr_required:
+                        self.log('COLLECTED THEM ALL')
                         state = DONE
                 received = []
                 if state == PROCESS_RECEIVED:
-                    state = CONFIRM
+                    state = LISTEN
 
             elif state == CONFIRM:
-                seed, message = self.pipe.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
-                self.log_sent_package(message)
+                if len(seeds_to_confirm) > 0:
+                    seed, message = self.pipe.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
+                    self.log_sent_package(message)
                 state = LISTEN
 
             elif state == ASK_TO_STOP:
@@ -397,15 +455,18 @@ class MyTCPProtocol(BaseProtocol):
                 self.log_sent_package(message)
                 state = LISTEN
 
-        self.log1(f"received ${self.inter_idx}: {format(buff)}\n")
+        self.log(f"received ${self.inter_idx}: {format(buff)}\n")
 
-        # seed, message = self.pipe.send_package(None, seeds_to_confirm, inter_idx=self.inter_idx)
+        # seed, message = self.pipe.send_package(None, [], inter_idx=self.inter_idx, meta=Metadata.STOP_SENDING)
         # self.log_sent_package(message)
 
         if nr_required is None or nr_collected < nr_required:
-            self.log1("RECEIVED INCOMPLETE DATA")
+            self.log("RECEIVED INCOMPLETE DATA")
+            while True:
+                time.sleep(1)
+                self.log('has caught an exception')
             raise Exception("RECEIVED INCOMPLETE DATA")
 
-        self.log2(clock() - start_time)
+        self.log(f'recv() in {clock_ms() - start_time:.5f} ms')
 
         return buff

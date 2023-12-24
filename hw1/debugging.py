@@ -1,4 +1,4 @@
-from debug_protocol import *
+from protocol_in_memory import *
 
 def format(x):
     if type(x) is bytearray or type(x) is bytes:
@@ -20,3 +20,8 @@ def log(*args, **kwargs):
     nr_logged += 1
     args = (format(x) for x in args)
     print(*args, **kwargs, file=open("log.txt", "a"))
+
+
+def print_fmt(*args, **kwargs):
+    args = (format(x) for x in args)
+    print(*args, **kwargs)

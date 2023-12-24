@@ -11,12 +11,12 @@ class InMemoryProtocol:
         self.t = t
 
     def sendto(self, data):
-        a, b, q = 10, 20, 70
+        a, b, q = 40, 20, 70
         lot = rand(0, q - 1)
         lot = q
         if lot < a:
             pass
-        elif lot < b:
+        elif lot < a + b:
             self.other.buffer += [data]
             self.other.buffer += [data]
         else:
