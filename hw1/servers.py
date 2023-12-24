@@ -32,7 +32,7 @@ class EchoClient(Base):
             i = 0
             while i < n:
                 j = i
-                while msg[j] != rhs[j]:
+                while j < len(msg) and msg[j] != rhs[j]:
                     j += 1
                 if i < j:
                     print(f'[{i}; {j})', file=open("args.txt", 'a'))

@@ -11,6 +11,8 @@ class InMemoryProtocol:
         self.t = t
 
     def sendto(self, data):
+        if type(data) is not bytes:
+            raise "Fuck the fucking fuck. Fuck the rest out."
         a, b, q = 40, 20, 70
         lot = rand(0, q - 1)
         lot = q

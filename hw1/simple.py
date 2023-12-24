@@ -11,7 +11,7 @@ a = MyTCPProtocol(None)
 b = MyTCPProtocol(a)
 a.other = b
 
-NR_INTER = 800
+NR_INTER = 4_000
 BIG_SIZE = 10
 
 message_pool = ["I can see you.", "I'm afraid you're going to jail", "You. Not me.",
