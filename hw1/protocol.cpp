@@ -177,7 +177,6 @@ struct Pipe {
 
     std::optional<Package> incoming(double max_duration = 0.00001)
     {
-        // print(f'{clock_ms() - time_zero:.3f} {name}: in \'em, eat \'em', file=fd);
         time_ms_t S_TIME = clock_ms();
         py_call(channel, "set_timeout", max_duration);
         py::bytes pre_chunk;
@@ -188,7 +187,6 @@ struct Pipe {
         }
         Bytes chunk = pre_chunk;
         std::optional<Package> package = package_wrapper.feed(chunk);
-        // print(f'{clock_ms() - time_zero:.3f} {name}: incoming(): {clock_ms() - S_TIME} ms', file=fd);
         return package;
     }
 
@@ -237,19 +235,6 @@ std::string fmt_seed(seed_t seed, uint32_t inter_idx)
     return std::format("\033[32;3mseed=${}!{}\033[0m", seed, inter_idx);
 }
 
-int o_retry_ms = 12;
-int o_no_hear = 5000;
-
-struct Guard_frequent {
-    time_ms_t frequency;
-    time_ms_t last_ping;
-    Guard_frequent(time_ms_t frequency)
-        : frequency(frequency)
-        , last_ping(clock_ms())
-    { }
-    bool bad() { return last_ping + frequency < clock_ms(); }
-    void ping() { last_ping = clock_ms(); }
-};
 struct Freq_remember {
     time_ms_t last_ping;
     Freq_remember()
@@ -268,7 +253,140 @@ std::string currentExceptionTypeName()
     return name;
 }
 
+struct Nullinator {
+    template<typename T>
+    Nullinator operator<<(T&& rhs) {
+        return *this;
+    }
+} nullinator;
+auto LUGGAGE = std::ofstream("bad-luggage");//nullinator
+
+struct Statistics {
+    time_ms_t default_value;
+    std::vector<std::pair<time_ms_t, int>> condensed;
+    int i = -1;
+    int total = 0;
+    int pref = 0;
+
+    Statistics(time_ms_t default_value)
+            : default_value(default_value)
+    {}
+
+    bool percentile(time_ms_t a, time_ms_t b) {
+        return a * 100 >= b * 80; /* a / b >= 0.80 */
+    }
+
+    void add(time_ms_t value)
+    {
+        int j = std::lower_bound(condensed.begin(), condensed.end(),
+                                 std::make_pair(value, 0)) -
+                condensed.begin();
+        total++;
+        if (j < condensed.size() && condensed[j].first == value) {
+            condensed[j].second++;
+            pref += (j <= i);
+        } else {
+            condensed.insert(condensed.begin() + j, std::make_pair(value, 1));
+            if (i == -1 || j <= i) {
+                i++;
+                pref++;
+            }
+        }
+        while (i > 0 && percentile(pref - condensed[i].second, total))
+            pref -= condensed[i--].second;
+        while (i + 1 < condensed.size() && !percentile(pref, total))
+            pref += condensed[++i].second;
+    }
+
+    time_ms_t average()
+    {
+        auto ret = total < 10 ? default_value : condensed[i].first;
+        for (int j = 0; j < condensed.size(); ++j) {
+            if (j)
+                LUGGAGE << ", ";
+            LUGGAGE << '(' << condensed[j].first << ", " << condensed[j].second << ')';
+            if (j == i)
+                LUGGAGE << "*";
+        }
+        LUGGAGE << '\n';
+        LUGGAGE << "Average = " << ret << ", i = " << i << '\n';
+        return ret;
+    }
+};
+
+struct WiseMind {
+    static constexpr int o_no_hear = 5000;
+    static constexpr int o_retry_ms = 9;
+
+    time_ms_t last_heard;
+    Freq_remember guard_1, guard_2, guard_confirm;
+    Statistics stats;
+
+    WiseMind()
+        : stats(o_retry_ms)
+    {
+        init_send();
+    }
+
+    void init_recv()
+    {
+        init_send();
+    }
+
+    void init_send()
+    {
+        guard_1 = Freq_remember();
+        guard_2 = Freq_remember();
+        guard_confirm = Freq_remember();
+        last_heard = clock_ms();
+    }
+
+    bool tired()
+    {
+        return clock_ms() > last_heard + o_no_hear;
+    }
+
+    void received_package()
+    {
+        auto now = clock_ms();
+        stats.add(now - last_heard);
+        last_heard = now;
+    }
+
+    time_ms_t hear()
+    {
+        time_ms_t res = std::max(stats.average(), time_ms_t(1));
+        return res + res / 2;
+    }
+
+    bool confirm()
+    {
+        if (guard_confirm.since_last_ping() < hear())
+            return false;
+        guard_confirm.ping();
+        return true;
+    }
+
+    bool ask_to_stop()
+    {
+        if (guard_1.since_last_ping() < 200)
+            return false;
+        guard_1.ping();
+        return true;
+    }
+
+    bool retry_package()
+    {
+        if (guard_2.since_last_ping() < hear())
+            return false;
+        guard_2.ping();
+        return true;
+    }
+};
+
 struct WiseProtocol {
+    WiseMind brain;
+
     static int nr_nodes;
     std::string name;
     Pipe pipe;
@@ -279,6 +397,15 @@ struct WiseProtocol {
         auto log_fn = (std::count(name.begin(), name.end(), 'J') ? logJ : logB);
         std::string trace = cpptrace::generate_trace().to_string();
         log_fn(trace);
+    }
+    void log1(std::string s)
+    {
+        // if constexpr (no_log) return;
+        std::string timestamp = std::to_string(clock_ms() - time_zero);
+        if (std::count(name.begin(), name.end(), 'J') != 0)
+            logJ(timestamp + " " + name + " " + s);
+        else
+            logB(timestamp + " " + name + " " + s);
     }
     void log(std::string s)
     {
@@ -355,7 +482,9 @@ try {
         inter_idx++;
 
         time_ms_t start_time = clock_ms();
-        log(std::format("ready for transaction ${} as sender", inter_idx));
+        log1(std::format("ready for transaction ${} as sender", inter_idx));
+
+        brain.init_send();
 
         int o_nr_hanging_segments = 10;
         int o_segment_len = 50000;
@@ -378,8 +507,6 @@ try {
 
         std::vector<Package> next_inter;
 
-        Guard_frequent time_guard(o_no_hear);
-        Freq_remember guard;
         while (state != DONE) {
             // log(std::format("is in state {}", state));
             switch (state) {
@@ -405,21 +532,19 @@ try {
                 break;
             }
             case CHECK_INCOMING: {
-                if (time_guard.bad()) {
+                if (brain.tired()) {
                     log("GOT FUCKING TIRED");
                     state = DONE;
                     break;
                 }
 
-                // log("will check for incoming");
                 auto package = pipe.incoming(0.01);
-                // log("got \'em, eat \'em");
                 if (!package) {
                     state = RETRY_SEGMENT;
                     break;
                 }
 
-                time_guard.ping();
+                brain.received_package();
                 log(std::format("received segment {}; {}", log_fmt(package->PAYLOAD), fmt_seed(package->SEED, package->INTER_IDX)));
 
                 if (package->INTER_IDX < inter_idx) {
@@ -448,11 +573,10 @@ try {
                 break;
             }
             case RETRY_SEGMENT: {
-                if (guard.since_last_ping() < o_retry_ms) {
+                if (!brain.retry_package()) {
                     state = CHECK_INCOMING;
                     break;
                 }
-                guard.ping();
 
                 if (sent.size() == 0)
                     throw std::logic_error("logic error");
@@ -492,7 +616,9 @@ try {
         inter_idx++;
 
         time_ms_t start_time = clock_ms();
-        log(std::format("ready for transaction ${} as listener", inter_idx));
+        log1(std::format("ready for transaction ${} as listener", inter_idx));
+
+        brain.init_recv();
 
         Bytes buff(n, 0);
 
@@ -515,15 +641,13 @@ try {
 
         int state = PROCESS_RECEIVED;
 
-        Guard_frequent time_guard(o_no_hear);
-        Freq_remember guard, confirm_guard;
         while (state != DONE) {
             // log(std::format("is in state {}", state));
             switch (state) {
             case LISTEN: {
                 static int silence_counter = 0;
                 silence_counter++;
-                if (time_guard.bad()) {
+                if (brain.tired()) {
                     log("GOT FUCKING TIRED");
                     state = DONE;
                     break;
@@ -535,7 +659,7 @@ try {
                     log(std::format("received{} segment {}; {}", maybe_fin, log_fmt(package->PAYLOAD), fmt_seed(package->SEED, package->INTER_IDX)));
                     received.push_back(*package);
                     state = PROCESS_RECEIVED;
-                    time_guard.ping();
+                    brain.received_package();
                     silence_counter = 0;
                 }
 
@@ -585,24 +709,23 @@ try {
                 break;
             }
             case CONFIRM: {
-                if (confirm_guard.since_last_ping() < o_retry_ms) {
+                if (seeds_to_confirm.size() == 0 ||
+                        !brain.confirm())
+                {
                     state = LISTEN;
                     break;
                 }
-                confirm_guard.ping();
-                if (seeds_to_confirm.size() > 0) {
-                    auto [seed, message] = pipe.send_package({}, seeds_to_confirm, inter_idx, Metadata::NONE);
-                    log_sent_package(message);
-                }
+
+                auto [seed, message] = pipe.send_package({}, seeds_to_confirm, inter_idx, Metadata::NONE);
+                log_sent_package(message);
                 state = LISTEN;
                 break;
             }
             case ASK_TO_STOP: {
-                if (guard.since_last_ping() < 200) {
+                if (!brain.ask_to_stop()) {
                     state = LISTEN;
                     continue;
                 }
-                guard.ping();
 
                 std::vector<seed_t> dummy;
                 auto [seed, message] = pipe.send_package({}, dummy, inter_idx, Metadata::STOP_SENDING);
